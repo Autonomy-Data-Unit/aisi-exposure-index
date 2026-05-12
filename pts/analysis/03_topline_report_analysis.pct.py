@@ -324,10 +324,18 @@ print(f"n_ads_2022 / 2025 = {n_ads_2022:,} / {n_ads_2025:,}")
 # %%
 # Occupation-level scores. The combined scores.csv currently ships the
 # absolute task-exposure variants; BT columns live alongside in a model-keyed
-# subdirectory and must be merged in.
+# subdirectory and must be merged in. The merge is defensive: if a future
+# `combine_onet_exposure` includes the BT columns in scores.csv directly, we
+# only bring in BT columns that aren't already present so we never end up
+# with pandas-style `_x` / `_y` duplicates.
 onet_df = pd.read_csv(ONET_SCORES_PATH)
 bt_df = pd.read_csv(BT_SCORES_PATH)
-onet_df = onet_df.merge(bt_df, on='onet_code', how='left')
+_bt_new_cols = [c for c in bt_df.columns if c != 'onet_code' and c not in onet_df.columns]
+if _bt_new_cols:
+    onet_df = onet_df.merge(bt_df[['onet_code', *_bt_new_cols]], on='onet_code', how='left')
+    print(f"merged BT columns from {BT_SCORES_PATH.name}: {_bt_new_cols}")
+else:
+    print("scores.csv already contains all BT columns; skipping merge")
 
 # Occupation titles from the O*NET source table (tab-separated).
 onet_titles = pd.read_csv(ONET_DATA_PATH, sep='\t')[['O*NET-SOC Code', 'Title']]
@@ -957,25 +965,36 @@ plt.show()
 print(f"Saved {FIG_DIR / 'top20_lads_tabular.png'}")
 
 # --- Geography scalars --------------------------------------------------
-# Use Section 6's ad-level Q3 threshold for "high exposure ad".
-ad_q3 = ad_q['thresholds']['exp_q3']
-# London share of high-exposure ads. Use DuckDB so we don't fold ads in pandas.
-share_query = con.execute(f"""
+# Two distinct things the report can say about London. Keep them separate so
+# the report cannot accidentally conflate them:
+#
+#   - **london_share_of_all_high_exposure_ads** = London's count of high-
+#     exposure ads divided by the corpus-wide count of high-exposure ads.
+#     "How much of the high-exposure pool comes from London?" If this
+#     exceeds London's share of all ads, London is over-represented at the
+#     high end.
+#   - **within_london_high_exposure_rate** = London's count of high-exposure
+#     ads divided by London's total ads. "What share of London ads are
+#     high-exposure?" Compare directly with the corpus-wide Q3 share (0.25)
+#     and with the within-group rates from Section 4.
+ad_q3 = ad_q['thresholds']['exp_q3']  # ad-level Q3 from Section 6
+london_counts = con.execute(f"""
   WITH joined AS (
     SELECT e.{exp_col} AS te, a.LAD22CD AS lad
     FROM ad_exp e LEFT JOIN adz.ads a ON e.ad_id = a.id
     WHERE e.n_matches > 0
   )
   SELECT
-    COUNT(*) FILTER (WHERE te >= {ad_q3} AND lad LIKE 'E09%') AS london_high,
-    COUNT(*) FILTER (WHERE te >= {ad_q3})                    AS all_high
+    COUNT(*) FILTER (WHERE lad LIKE 'E09%')                    AS london_total,
+    COUNT(*) FILTER (WHERE te >= {ad_q3} AND lad LIKE 'E09%')  AS london_high,
+    COUNT(*) FILTER (WHERE te >= {ad_q3})                      AS corpus_high
   FROM joined
 """).fetchone()
-london_high, all_high = share_query
-london_share_high = london_high / all_high if all_high else float('nan')
+london_total, london_high, corpus_high = london_counts
+london_share_of_all_high = (london_high / corpus_high) if corpus_high else float('nan')
+within_london_high_rate  = (london_high / london_total) if london_total else float('nan')
+london_share_of_all_ads  = (london_total / n_ads_total)  # for context — does London punch above its weight?
 
-lad_q3 = lad_q['thresholds']['exp_q3']
-n_lads_above_75 = int((geo_df[exp_col] >= lad_q3).sum())
 top_lad = geo_df.sort_values(exp_col, ascending=False).iloc[0]
 
 topline_numbers['geography'] = {
@@ -985,13 +1004,18 @@ topline_numbers['geography'] = {
         'task_exposure_mean': float(top_lad['task_exposure_mean']),
         'n_ads': int(top_lad['n_ads']),
     },
-    'london_share_of_high_exposure_ads': float(london_share_high),
-    'n_lads_above_75th_percentile_task_exposure': n_lads_above_75,
+    'london_share_of_all_high_exposure_ads': float(london_share_of_all_high),
+    'within_london_high_exposure_rate':       float(within_london_high_rate),
+    'london_share_of_all_ads':                float(london_share_of_all_ads),
+    'london_n_ads':                            int(london_total),
+    'london_n_high_exposure_ads':              int(london_high),
+    'corpus_n_high_exposure_ads':              int(corpus_high),
     'note_itl1_regional': 'deferred (needs ONS LAD-to-ITL1 lookup)',
 }
-print(f"\nlondon_share_of_high_exposure_ads = {london_share_high:.4f}")
-print(f"n_lads_above_75th_percentile      = {n_lads_above_75}")
-print(f"top_lad                           = {top_lad['LAD22NM']} ({top_lad['LAD22CD']}, n_ads={int(top_lad['n_ads']):,})")
+print(f"\nlondon_share_of_all_high_exposure_ads = {london_share_of_all_high:.4f}")
+print(f"within_london_high_exposure_rate      = {within_london_high_rate:.4f}")
+print(f"london_share_of_all_ads               = {london_share_of_all_ads:.4f}")
+print(f"top_lad                               = {top_lad['LAD22NM']} ({top_lad['LAD22CD']}, n_ads={int(top_lad['n_ads']):,})")
 
 # %% [markdown]
 # ## Section 8 — Metric robustness and disagreement
@@ -1232,25 +1256,53 @@ print(f"ad_primary built: {n_primary:,} rows ({n_primary/n_ads_total:.4%} of ana
 
 # %%
 # --- 4.1 Major-group level --------------------------------------------
+#
+# Two distinct statistics that the report must not conflate:
+#
+#   - **high_exposure_rate** = within this major group, what share of *its*
+#     ads are high-exposure (Q4). Answers: "is work in group X concentrated
+#     in high-exposure roles?"
+#   - **share_of_all_high_exposure_ads** = this major group's count of
+#     high-exposure ads divided by the corpus-wide total of high-exposure
+#     ads. Answers: "how much of the high-exposure pool does group X supply?"
+#
+# A group can have a high rate but a small share (small group, mostly
+# high-exposure jobs) or a low rate but a large share (large group with a
+# minority of high-exposure jobs). Both views are reported below; the
+# scalars in `topline_numbers.json` carry both rankings separately.
+
 ad_q3_abs = ad_q['thresholds']['exp_q3']  # ad-level Q3 from Section 6
+total_high_ads = int(con.execute(
+    f"SELECT COUNT(*) FROM ad_primary WHERE task_exposure_mean >= {ad_q3_abs}"
+).fetchone()[0])
 
 major_w = con.execute(f"""
   SELECT primary_major_code AS major_code,
          COUNT(*)             AS n_ads,
+         SUM(CASE WHEN task_exposure_mean >= {ad_q3_abs} THEN 1 ELSE 0 END) AS n_high,
          AVG(task_exposure_mean)    AS mean_task_exposure,
          AVG(task_exposure_bt_mean) AS mean_task_exposure_bt,
          AVG(felten_score)          AS mean_felten,
          AVG(presence_composite)    AS mean_presence,
-         AVG(CASE WHEN task_exposure_mean >= {ad_q3_abs} THEN 1 ELSE 0 END) AS share_high_exposure
+         AVG(CASE WHEN task_exposure_mean >= {ad_q3_abs} THEN 1 ELSE 0 END) AS high_exposure_rate
   FROM ad_primary GROUP BY primary_major_code ORDER BY n_ads DESC
 """).fetchdf()
 major_w['major_group'] = major_w['major_code'].map(ONET_MAJOR_NAMES)
-major_w = major_w[['major_code', 'major_group', 'n_ads',
+major_w['share_of_all_high_exposure_ads'] = major_w['n_high'] / float(total_high_ads)
+major_w = major_w[['major_code', 'major_group', 'n_ads', 'n_high',
+                   'high_exposure_rate', 'share_of_all_high_exposure_ads',
                    'mean_task_exposure', 'mean_task_exposure_bt',
-                   'mean_felten', 'mean_presence', 'share_high_exposure']]
+                   'mean_felten', 'mean_presence']]
 major_w.to_csv(TABLES_DIR / "exposure_by_major_group_ad_weighted.csv", index=False)
 print("Ad-weighted statistics by major group (top match):")
 print(major_w.to_string(index=False, float_format=lambda v: f'{v:.4f}'))
+print(f"\nTotal high-exposure ads (task_exposure_mean >= ad_q3 = {ad_q3_abs:.4f}): {total_high_ads:,}")
+print("\nTop 5 by within-group high_exposure_rate:")
+print(major_w.nlargest(5, 'high_exposure_rate')[['major_group', 'n_ads', 'n_high', 'high_exposure_rate']]
+      .to_string(index=False, float_format=lambda v: f'{v:.4f}'))
+print("\nTop 5 by share_of_all_high_exposure_ads:")
+print(major_w.nlargest(5, 'share_of_all_high_exposure_ads')[['major_group', 'n_ads', 'n_high', 'share_of_all_high_exposure_ads']]
+      .to_string(index=False, float_format=lambda v: f'{v:.4f}'))
 
 # --- 4.2 Top 20 occupations by share of high-exposure ads -------------
 # share_of_high_exposure = (# ads where top match is X AND task_exposure_mean >= ad_q3) / total_high_exposure_ads
@@ -1292,24 +1344,30 @@ print("\nTop 20 occupations by share of high-exposure ads (top-match proxy):")
 print(occ_w.to_string(index=False, float_format=lambda v: f'{v:.4f}'))
 
 # --- 4.3 JSON scalars ---------------------------------------------------
-top_groups_by_volume_high = major_w.sort_values('share_high_exposure', ascending=False).head(3)
-top_5_groups_share = major_w.nlargest(5, 'share_high_exposure')
-total_high_ads = con.execute(f"SELECT COUNT(*) FROM ad_primary WHERE task_exposure_mean >= {ad_q3_abs}").fetchone()[0]
-top_5_groups_share_total = float(con.execute(f"""
-  SELECT SUM(CASE WHEN task_exposure_mean >= {ad_q3_abs} THEN 1 ELSE 0 END) / CAST({total_high_ads} AS DOUBLE)
-  FROM ad_primary
-  WHERE primary_major_code IN ({','.join(str(int(c)) for c in top_5_groups_share['major_code'])})
-""").fetchone()[0])
+# Two rankings, kept separate so the report cannot accidentally conflate them.
+top_3_by_rate = major_w.nlargest(3, 'high_exposure_rate')
+top_3_by_share = major_w.nlargest(3, 'share_of_all_high_exposure_ads')
+top_5_by_share = major_w.nlargest(5, 'share_of_all_high_exposure_ads')
 
 topline_numbers['ad_weighted_contribution'] = {
-    'top_3_major_groups_by_ad_volume_high_exposure': top_groups_by_volume_high['major_group'].tolist(),
-    'top_3_major_groups_share_high_exposure_values': [float(v) for v in top_groups_by_volume_high['share_high_exposure']],
-    'share_high_exposure_ads_top_5_major_groups': top_5_groups_share_total,
     'ad_q3_threshold_used': float(ad_q3_abs),
+    'total_high_exposure_ads': total_high_ads,
+    'top_3_major_groups_by_high_exposure_rate': [
+        {'major_group': str(r['major_group']), 'rate': float(r['high_exposure_rate']),
+         'n_ads': int(r['n_ads']), 'n_high': int(r['n_high'])}
+        for _, r in top_3_by_rate.iterrows()
+    ],
+    'top_3_major_groups_by_share_of_all_high_exposure_ads': [
+        {'major_group': str(r['major_group']), 'share_of_all_high': float(r['share_of_all_high_exposure_ads']),
+         'n_high': int(r['n_high']), 'within_group_rate': float(r['high_exposure_rate'])}
+        for _, r in top_3_by_share.iterrows()
+    ],
+    'share_of_all_high_exposure_ads_top_5_major_groups': float(top_5_by_share['share_of_all_high_exposure_ads'].sum()),
     'note': 'Major group assigned via top-rerank-score match per ad (proxy).',
 }
-print(f"\ntop_3_major_groups_by_high_exposure_share = {topline_numbers['ad_weighted_contribution']['top_3_major_groups_by_ad_volume_high_exposure']}")
-print(f"share_high_exposure_ads_top_5_major_groups = {top_5_groups_share_total:.4f}")
+print(f"\ntop 3 by within-group rate           = {[r['major_group'] for r in topline_numbers['ad_weighted_contribution']['top_3_major_groups_by_high_exposure_rate']]}")
+print(f"top 3 by share of all high-exposure  = {[r['major_group'] for r in topline_numbers['ad_weighted_contribution']['top_3_major_groups_by_share_of_all_high_exposure_ads']]}")
+print(f"top-5-groups share of all high       = {topline_numbers['ad_weighted_contribution']['share_of_all_high_exposure_ads_top_5_major_groups']:.4f}")
 
 # %% [markdown]
 # ## Section 7 — 2022 vs 2025 compositional change
@@ -1584,12 +1642,13 @@ Tables live in `../tables/`. Figures live in `../figures/`.
 
 ### Geography
 - Top LAD by absolute task exposure: **{geo['top_lad_by_task_exposure']['LAD22NM']}** ({geo['top_lad_by_task_exposure']['LAD22CD']}, n_ads={_fmt(geo['top_lad_by_task_exposure']['n_ads'])}, score {geo['top_lad_by_task_exposure']['task_exposure_mean']:.4f}).
-- London's share of high-exposure ads: {geo['london_share_of_high_exposure_ads']:.2%}.
-- LADs above the LAD-level Q3 task-exposure threshold: {geo['n_lads_above_75th_percentile_task_exposure']}.
+- London supplies {geo['london_share_of_all_high_exposure_ads']:.2%} of all high-exposure ads in the corpus (London has {geo['london_share_of_all_ads']:.2%} of all analysed ads -- so London is over-represented at the high end).
+- Within London, {geo['within_london_high_exposure_rate']:.2%} of ads are high-exposure (vs the corpus-wide 25.00% by Q3 construction).
 
 ### Sectoral contribution (top-match proxy)
-- Top 3 major groups by share of high-exposure ads: {ct['top_3_major_groups_by_ad_volume_high_exposure']}.
-- Top 5 major groups account for {ct['share_high_exposure_ads_top_5_major_groups']:.2%} of all high-exposure ads.
+- Top 3 major groups by **within-group high-exposure rate**: {[r['major_group'] for r in ct['top_3_major_groups_by_high_exposure_rate']]} (rates: {[f"{r['rate']:.1%}" for r in ct['top_3_major_groups_by_high_exposure_rate']]}).
+- Top 3 major groups by **share of all high-exposure ads**: {[r['major_group'] for r in ct['top_3_major_groups_by_share_of_all_high_exposure_ads']]} (shares: {[f"{r['share_of_all_high']:.1%}" for r in ct['top_3_major_groups_by_share_of_all_high_exposure_ads']]}).
+- Top 5 major groups together supply {ct['share_of_all_high_exposure_ads_top_5_major_groups']:.2%} of all high-exposure ads.
 
 ### Temporal (2022 vs 2025)
 - Δ mean absolute task exposure: {tp['delta_mean_task_exposure_2022_2025']:+.4f}.
