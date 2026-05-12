@@ -2,11 +2,11 @@
 
 ## Project Overview
 
-**ai-index** (AISI Exposure Index) is a productionized data pipeline for analyzing AI exposure in the economy. It matches job advertisements to O\*NET occupations and computes AI impact metrics (ASPECTT vectors, AI exposure scores, seniority/job zone).
+**ai-index** (AISI Exposure Index) is a productionized data pipeline for analyzing AI exposure in the economy. It matches job advertisements to O\*NET occupations and computes multi-dimensional AI exposure scores (presence/humanness, Felten AIOE, LLM task exposure, pairwise Bradley-Terry task exposure), then aggregates them by geography.
 
 ## Pipeline DAG
 
-The pipeline is defined in `config/netrun.json`. Run `uv run netrun validate -c config/netrun.json` to check the current node/edge counts. Each node is a module at `ai_index.nodes.<name>` (developed as `pts/ai_index/nodes/<name>.pct.py`). The pipeline has three parallel tracks that converge at index construction:
+The pipeline is defined in `config/netrun.json` (currently 18 nodes, 21 edges). Run `uv run netrun validate -c config/netrun.json` to check the current node/edge counts. Each node is a module at `ai_index.nodes.<name>` (developed as `pts/ai_index/nodes/<name>.pct.py`). The pipeline has three parallel tracks that converge at index construction:
 
 ### Stage 1: Data Ingestion & Preparation
 
@@ -29,25 +29,26 @@ Matches job ads to O\*NET occupations through a multi-stage retrieval pipeline:
 
 ### Stage 2b: O\*NET Exposure Scoring (green path)
 
-Runs in parallel with job ad matching, triggered by `broadcast_onet_ready` (1-to-4 fan-out):
+Runs in parallel with job ad matching, triggered by `broadcast_onet_ready` (1-to-5 fan-out -- one branch goes to `embed_onet` for the matching path, the other four to the score nodes below):
 
 - **`score_presence`** -- Computes humanness/presence scores (physical, emotional, creative dimensions) per occupation from O\*NET work context, GWAs, and skills data.
 - **`score_felten`** -- Computes Felten AIOE ability-application AI exposure scores per occupation, with configurable progress scenarios.
 - **`score_task_exposure`** -- LLM-based task-level AI exposure classification. Evaluates each O\*NET task for AI automation potential and aggregates to occupation level.
-- **`join_scores`** -- Synchronization barrier (3-to-1 join). Waits for all three score nodes to complete.
+- **`score_task_exposure_bt`** -- Pairwise Bradley-Terry scoring of O\*NET tasks by AI exposure. Runs multi-round pairwise comparisons via LLM and fits a BT model to produce a continuous exposure score per task, aggregated to occupation level.
+- **`join_scores`** -- Synchronization barrier (4-to-1 join). Waits for all four score nodes to complete.
 - **`combine_onet_exposure`** -- Merges all score DataFrames into a single combined exposure table. Validates occupation set consistency.
 
 ### Stage 3: Index Construction (red path)
 
 Converges the matching and scoring results:
 
-- **`compute_job_ad_exposure`** -- Maps occupation-level exposure scores to individual job ads via rerank-score-weighted averaging.
+- **`compute_job_ad_exposure`** -- Maps occupation-level exposure scores to individual job ads. For each ad, rerank scores across its candidate occupations are min-max scaled to [0, 1] then passed through a softmax (temperature 0.7) to produce per-candidate weights; the score columns are then weighted-averaged. The temperature is tuned to balance within-group stability (lower T) against cross-reranker agreement (higher T).
 - **`aggregate_geo`** -- Aggregates ad-level AI exposure scores by Local Authority District (LAD22CD). Produces the final geographic index.
 
 ### Infrastructure Nodes
 
-- **`broadcast_onet_ready`** -- Fan-out (1-to-4): triggers `embed_onet`, `score_presence`, `score_felten`, `score_task_exposure` after O\*NET preparation completes.
-- **`join_scores`** -- Synchronization barrier (3-to-1): collects outputs from the three score nodes before combining.
+- **`broadcast_onet_ready`** -- Fan-out (1-to-5): triggers `embed_onet`, `score_presence`, `score_felten`, `score_task_exposure`, and `score_task_exposure_bt` after O\*NET preparation completes.
+- **`join_scores`** -- Synchronization barrier (4-to-1): collects outputs from the four score nodes (`score_presence`, `score_felten`, `score_task_exposure`, `score_task_exposure_bt`) before combining.
 
 ### Node Storage Convention
 
@@ -79,7 +80,7 @@ The pipeline is run via `run_pipeline_async(run_name)` (or the `run-pipeline` CL
 4. Load netrun config — `NetConfig.from_file(netrun.json, global_node_vars=..., node_vars=...)` injects the resolved values into the graph's unfilled `NodeVariable` placeholders
 5. Execute — `async with Net(config) as net:` starts the net, then loops `run_until_blocked()` until no progress
 
-Run name is determined by: explicit argument > `RUN_NAME` env var > `"baseline"`.
+Run name is **required**: pass it as the explicit argument to `run-pipeline` or set the `RUN_NAME` env var. There is no implicit default -- if neither is provided, the runner raises `ValueError`. `sample_n = -1` in a run definition means "process all available ads"; any positive integer samples that many ad IDs.
 
 ### Key files
 - `src/ai_index/run_pipeline.py` — `run_pipeline_async()`, `_load_run_defs()`, `_resolve_run_defs()`
@@ -328,7 +329,7 @@ nbl test                      # Test all notebooks execute
 - `#|default_exp module_name` - Set export target module (once per notebook, near top)
 - `#|export` - Export cell to the Python module
 - `#|exporti` - Export but exclude from `__all__`
-- `#|top_export` - Export at module level, **outside** the generated function (for `export_as_func` notebooks). Use this for classes, constants, or imports that need to be importable from the module by other modules. Example: `JobInfoModel` in `llm_summarise` is `#|top_export` so `embed_ads` can `from ai_index.nodes.llm_summarise import JobInfoModel`.
+- `#|top_export` - Export at module level, **outside** the generated function (for `export_as_func` notebooks). Use this for classes, constants, or imports that need to be importable from the module by other modules. Example: `TaskExposureModel` in `score_task_exposure` is `#|top_export` so other code can `from ai_index.nodes.score_task_exposure import TaskExposureModel`.
 - `#|hide` - Hide cell from docs
 - `#|eval: false` - Skip cell during execution
 - `#|export_as_func true` - Export entire notebook as a callable function
@@ -516,7 +517,7 @@ Global node var (`config/netrun.json`) inherited by all 6 sbatch-capable nodes. 
 
 ### `sbatch_time` node variable (IMPORTANT)
 
-**Per-node** var (not global) on all 6 sbatch-capable nodes (`llm_summarise`, `llm_filter_candidates`, `embed_ads`, `embed_onet`, `cosine_match`, `score_task_exposure`). Controls the Slurm `--time` walltime limit for sbatch jobs submitted by that node.
+**Per-node** var (not global) on all 6 sbatch-capable nodes (`embed_ads`, `embed_onet`, `llm_filter_candidates`, `rerank_candidates`, `score_task_exposure`, `score_task_exposure_bt`). Controls the Slurm `--time` walltime limit for sbatch jobs submitted by that node.
 
 **This value must be adjusted when changing `sample_n`.** The walltime needed scales with input size: 1000 ads needs minutes, 30M ads needs hours. If the walltime is too short, Slurm kills the job mid-execution. Defaults in `config/run_defs.toml` are set for full-scale runs (~30M ads). The `[runs.calibration]` section overrides them with shorter values suitable for `sample_n=1000`.
 

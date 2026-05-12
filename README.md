@@ -26,28 +26,29 @@ Required environment variables (see `.env.sample`):
 ## Running the pipeline
 
 ```bash
-uv run run-pipeline [RUN_NAME]
+uv run run-pipeline <RUN_NAME>
 ```
 
-The run name selects a configuration from `config/run_defs.toml`. If omitted, defaults to `baseline` (which uses the `[defaults]` section: 10 sample ads, sbatch models).
+The run name selects a configuration from `config/run_defs.toml`. It is required: pass it as a positional argument or set the `RUN_NAME` env var. There is no implicit default.
 
 ### Available runs
 
 | Run | Sample size | Models | Purpose |
 |-----|-------------|--------|---------|
-| *(default)* | 10 ads | bge-large + qwen-7b (sbatch) | Quick test with HPC |
 | `test_api` | 10 ads | text-embedding-3-large + gpt-5.2 (API) | Test with OpenAI API |
 | `test_local` | 10 ads | bge-large + qwen-0.5b (CPU) | Test locally, no GPU |
 | `test_sbatch` | 10 ads | bge-large + qwen-7b (sbatch) | Test on Isambard HPC |
 | `validation_5k` | 5,000 ads | sbatch models | Validation experiments |
+| `validation_50k` | 50,000 ads | sbatch models | Larger-scale validation |
 | `benchmark_5k` | 5,000 ads | gpt-5.4 + text-embedding-3-large + zerank-2 | Frontier model benchmark |
+| `production_5m` | 5M ads | qwen3-embed-8b + gemma-27b + qwen3-reranker-8b | Full production run |
 | `calibration` | 1,000 ads | configurable | GPU-hours estimation |
 
 Run definitions are composable: each named run inherits from `[defaults]` and overrides specific values. See `config/run_defs.toml` for the full list.
 
 ## Pipeline overview
 
-The pipeline is a 17-node DAG orchestrated by [netrun](https://github.com/lukastk/netrun). It has three stages that run partly in parallel. See the [interactive pipeline graph](https://htmlpreview.github.io/?https://github.com/Autonomy-Data-Unit/aisi-exposure-index/blob/main/pipeline.html) for the full DAG visualization.
+The pipeline is an 18-node DAG (21 edges) orchestrated by [netrun](https://github.com/lukastk/netrun). It has three stages that run partly in parallel. See the [interactive pipeline graph](https://htmlpreview.github.io/?https://github.com/Autonomy-Data-Unit/aisi-exposure-index/blob/main/pipeline.html) for the full DAG visualization.
 
 ### Stage 1: Data ingestion
 
@@ -66,16 +67,17 @@ Matches each job ad to O\*NET occupations through a multi-stage retrieval pipeli
 
 ### Stage 2b: O\*NET exposure scoring
 
-Runs in parallel with ad matching. Computes three independent AI exposure dimensions per occupation:
+Runs in parallel with ad matching. Computes four independent AI exposure dimensions per occupation:
 
 - **`score_presence`**: Humanness/presence scores (physical, emotional, creative) from O\*NET work context data.
 - **`score_felten`**: Felten AIOE ability-application AI exposure scores.
-- **`score_task_exposure`**: LLM-based task-level AI exposure classification (3-level scale).
-- **`combine_onet_exposure`**: Merges all scores into a single combined table.
+- **`score_task_exposure`**: LLM-based task-level AI exposure classification.
+- **`score_task_exposure_bt`**: Pairwise Bradley-Terry scoring of O\*NET tasks by AI exposure.
+- **`combine_onet_exposure`**: Merges all scores into a single combined table (preceded by a `join_scores` 4-to-1 synchronization barrier).
 
 ### Stage 3: Index construction
 
-- **`compute_job_ad_exposure`**: Maps occupation-level scores to individual ads via rerank-score-weighted averaging.
+- **`compute_job_ad_exposure`**: Maps occupation-level scores to individual ads. For each ad, rerank scores across its candidate occupations are min-max scaled to [0, 1] and passed through a softmax (temperature 0.7) to produce per-candidate weights, then the score columns are weighted-averaged.
 - **`aggregate_geo`**: Aggregates ad-level exposure scores by Local Authority District (LAD22CD).
 
 ## Execution modes
