@@ -34,10 +34,19 @@ from pathlib import Path
 
 import duckdb
 import matplotlib
-# Use a non-interactive backend so saving figures from a plain `python file.py`
-# execution does not pop up a GUI window. Inline display still works under
-# Jupyter because the inline backend is selected before user code runs.
-matplotlib.use('Agg')
+# Pick a matplotlib backend that suits how the notebook is being run.
+# Script execution (`python file.py`) gets Agg so no GUI window pops up.
+# Jupyter / nbl fill keeps the inline backend so figure outputs are
+# embedded in the .ipynb.
+try:
+    from IPython import get_ipython
+    _ipy = get_ipython()
+    if _ipy is None:
+        matplotlib.use('Agg')
+    else:
+        _ipy.run_line_magic('matplotlib', 'inline')
+except (ImportError, AttributeError):
+    matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -268,7 +277,7 @@ ax.legend(frameon=False, loc='upper center', ncol=2, bbox_to_anchor=(0.5, -0.12)
 ax.margins(y=0.18)
 plt.tight_layout()
 plt.savefig(FIG_DIR / "sampling_audit.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'sampling_audit.png'}")
 
 # %% [markdown]
@@ -657,7 +666,7 @@ for ax, (col, label, color) in zip(axes.flat, hist_targets):
 fig.suptitle('Ad-weighted exposure distributions (Adzuna corpus, 5M sample, n_matches > 0)', fontweight='bold')
 plt.tight_layout()
 plt.savefig(FIG_DIR / "ad_weighted_distribution.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'ad_weighted_distribution.png'}")
 
 # %% [markdown]
@@ -832,7 +841,7 @@ fig.suptitle(f'Quadrant counts at three altitudes (canonical Q4 x Q1 definition,
              fontweight='bold')
 plt.tight_layout()
 plt.savefig(FIG_DIR / "quadrant_counts_panel.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'quadrant_counts_panel.png'}")
 
 # Headline scalars
@@ -944,7 +953,7 @@ for ax, (key, sv) in zip(axes, SCORE_VARIANTS.items()):
 fig.suptitle('Top 20 LADs by ad-weighted task exposure (5M sample)', fontweight='bold')
 plt.tight_layout()
 plt.savefig(FIG_DIR / "top20_lads_tabular.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'top20_lads_tabular.png'}")
 
 # --- Geography scalars --------------------------------------------------
@@ -1042,7 +1051,7 @@ plt.colorbar(im, ax=ax, shrink=0.8, label='Spearman ρ')
 ax.set_title('Cross-metric rank correlations (861 O*NET occupations)', fontweight='bold')
 plt.tight_layout()
 plt.savefig(FIG_DIR / "correlation_matrix_extended.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'correlation_matrix_extended.png'}")
 
 # %% [markdown]
@@ -1094,7 +1103,7 @@ for ax, (label, mean_col, iw_col) in zip(axes, [
     ax.set_title(f'{label}\nρ = {rho:.3f}', fontweight='bold')
 plt.tight_layout()
 plt.savefig(FIG_DIR / "importance_weighting_scatter.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'importance_weighting_scatter.png'}")
 
 # %% [markdown]
@@ -1423,7 +1432,7 @@ fig.suptitle('2022 vs 2025 compositional change in the Adzuna corpus (top-match 
              fontweight='bold')
 plt.tight_layout()
 plt.savefig(FIG_DIR / "temporal_change_summary.png", dpi=300, bbox_inches='tight')
-plt.close('all')
+plt.show()
 print(f"Saved {FIG_DIR / 'temporal_change_summary.png'}")
 
 # --- 7.4 JSON scalars ---------------------------------------------------
