@@ -1,0 +1,338 @@
+{
+  "extra": {
+    "description": "AISI AI job-ad annotation pipeline. Reads ad_ids from a completed exposure run, joins to adzuna for text, applies a deterministic AI keyword prefilter, then runs Batch 1 LLM passes (boolean AI detection + seniority/management). Structurally independent from config/netrun.json so the exposure pipeline cannot accidentally re-execute."
+  },
+  "node_vars": {
+    "run_name": {
+      "type": "str"
+    },
+    "sample_n": {
+      "type": "int"
+    },
+    "llm_model": {
+      "type": "str"
+    },
+    "sbatch_cache": {
+      "type": "bool"
+    },
+    "duckdb_memory_limit": {
+      "type": "str"
+    },
+    "temperature": {
+      "type": "float"
+    },
+    "top_p": {
+      "type": "float"
+    },
+    "top_k": {
+      "type": "int"
+    }
+  },
+  "storage": {
+    "cache": {
+      "enabled": false,
+      "include_all_nodes": true,
+      "storage_path": ".cache/netrun_annotations"
+    }
+  },
+  "pools": {
+    "main": {
+      "spec": {
+        "type": "thread",
+        "num_workers": 4
+      }
+    }
+  },
+  "max_epochs": 1,
+  "retries": 3,
+  "retry_wait": 10,
+  "project_root_override": "../",
+  "graph": {
+    "nodes": [
+      {
+        "name": "build_annotation_universe",
+        "description": "Source node: read ad_ids from the upstream exposure run, join to adzuna for title/description, write annotation_universe_v1.parquet.",
+        "execution_config": {
+          "run_on_init": true,
+          "node_vars": {
+            "input_run_name": {
+              "type": "str"
+            }
+          },
+          "signals": [
+            "epoch_finished"
+          ]
+        },
+        "extra": {
+          "source_path": "src/ai_annotations/nodes/build_annotation_universe.py"
+        },
+        "factory": "netrun.node_factories.from_function",
+        "factory_args": {
+          "func": "ai_annotations.nodes.build_annotation_universe.main"
+        },
+        "type": "node"
+      },
+      {
+        "name": "pass0_ai_keyword_prefilter",
+        "description": "Deterministic AI keyword prefilter over the universe. No LLM.",
+        "execution_config": {
+          "signals": [
+            "epoch_finished"
+          ]
+        },
+        "extra": {
+          "source_path": "src/ai_annotations/nodes/pass0_ai_keyword_prefilter.py"
+        },
+        "factory": "netrun.node_factories.from_function",
+        "factory_args": {
+          "func": "ai_annotations.nodes.pass0_ai_keyword_prefilter.main"
+        },
+        "type": "node"
+      },
+      {
+        "name": "build_annotation_routing",
+        "description": "Compute per-ad eligibility flags for the LLM passes.",
+        "execution_config": {
+          "node_vars": {
+            "batch1_route": {
+              "type": "str"
+            },
+            "pass5_route": {
+              "type": "str"
+            }
+          },
+          "signals": [
+            "epoch_finished"
+          ]
+        },
+        "extra": {
+          "source_path": "src/ai_annotations/nodes/build_annotation_routing.py"
+        },
+        "factory": "netrun.node_factories.from_function",
+        "factory_args": {
+          "func": "ai_annotations.nodes.build_annotation_routing.main"
+        },
+        "type": "node"
+      },
+      {
+        "name": "broadcast_routing",
+        "description": "Fan out the routing output to both LLM passes.",
+        "factory": "netrun.node_factories.broadcast",
+        "factory_args": {
+          "num_outputs": 2
+        },
+        "type": "node"
+      },
+      {
+        "name": "pass1_boolean_ai_detection",
+        "description": "LLM pass 1: nine boolean AI-salience flags + confidence + evidence.",
+        "execution_config": {
+          "node_vars": {
+            "llm_model": {
+              "inherit": true
+            },
+            "sbatch_cache": {
+              "inherit": true
+            },
+            "temperature": {
+              "inherit": true
+            },
+            "top_p": {
+              "inherit": true
+            },
+            "top_k": {
+              "inherit": true
+            },
+            "duckdb_memory_limit": {
+              "inherit": true
+            },
+            "sbatch_time": {
+              "type": "str"
+            },
+            "chunk_size": {
+              "type": "int"
+            },
+            "max_new_tokens": {
+              "type": "int"
+            },
+            "max_concurrent_chunks": {
+              "type": "int"
+            },
+            "pass_resume": {
+              "type": "bool"
+            },
+            "pass_max_retries": {
+              "type": "int"
+            },
+            "pass_raise_on_failure": {
+              "type": "bool"
+            },
+            "system_prompt": {
+              "type": "str"
+            },
+            "user_prompt": {
+              "type": "str"
+            },
+            "prompt_version": {
+              "type": "str"
+            }
+          }
+        },
+        "extra": {
+          "source_path": "src/ai_annotations/nodes/pass1_boolean_ai_detection.py"
+        },
+        "factory": "netrun.node_factories.from_function",
+        "factory_args": {
+          "func": "ai_annotations.nodes.pass1_boolean_ai_detection.main"
+        },
+        "type": "node"
+      },
+      {
+        "name": "pass5_seniority_management",
+        "description": "LLM pass 5: seniority and management level. Independent of the AI keyword filter.",
+        "execution_config": {
+          "node_vars": {
+            "llm_model": {
+              "inherit": true
+            },
+            "sbatch_cache": {
+              "inherit": true
+            },
+            "temperature": {
+              "inherit": true
+            },
+            "top_p": {
+              "inherit": true
+            },
+            "top_k": {
+              "inherit": true
+            },
+            "duckdb_memory_limit": {
+              "inherit": true
+            },
+            "sbatch_time": {
+              "type": "str"
+            },
+            "chunk_size": {
+              "type": "int"
+            },
+            "max_new_tokens": {
+              "type": "int"
+            },
+            "max_concurrent_chunks": {
+              "type": "int"
+            },
+            "pass_resume": {
+              "type": "bool"
+            },
+            "pass_max_retries": {
+              "type": "int"
+            },
+            "pass_raise_on_failure": {
+              "type": "bool"
+            },
+            "system_prompt": {
+              "type": "str"
+            },
+            "user_prompt": {
+              "type": "str"
+            },
+            "prompt_version": {
+              "type": "str"
+            }
+          }
+        },
+        "extra": {
+          "source_path": "src/ai_annotations/nodes/pass5_seniority_management.py"
+        },
+        "factory": "netrun.node_factories.from_function",
+        "factory_args": {
+          "func": "ai_annotations.nodes.pass5_seniority_management.main"
+        },
+        "type": "node"
+      },
+      {
+        "name": "join_passes",
+        "description": "Synchronisation barrier: wait for both Pass 1 and Pass 5 to complete.",
+        "factory": "netrun.node_factories.join",
+        "factory_args": {
+          "ports": [
+            "pass1",
+            "pass5"
+          ]
+        },
+        "type": "node"
+      },
+      {
+        "name": "assemble_wide_annotation",
+        "description": "Left-join universe/pass0/routing/pass1/pass5 on ad_id into the convenience wide table.",
+        "extra": {
+          "source_path": "src/ai_annotations/nodes/assemble_wide_annotation.py"
+        },
+        "factory": "netrun.node_factories.from_function",
+        "factory_args": {
+          "func": "ai_annotations.nodes.assemble_wide_annotation.main"
+        },
+        "type": "node"
+      }
+    ],
+    "edges": [
+      {
+        "source_node": "build_annotation_universe",
+        "source_port": "ad_ids",
+        "target_node": "pass0_ai_keyword_prefilter",
+        "target_port": "ad_ids",
+        "dependency": false
+      },
+      {
+        "source_node": "pass0_ai_keyword_prefilter",
+        "source_port": "ad_ids",
+        "target_node": "build_annotation_routing",
+        "target_port": "ad_ids",
+        "dependency": false
+      },
+      {
+        "source_node": "build_annotation_routing",
+        "source_port": "ad_ids",
+        "target_node": "broadcast_routing",
+        "target_port": "in_0",
+        "dependency": false
+      },
+      {
+        "source_node": "broadcast_routing",
+        "source_port": "out_0",
+        "target_node": "pass1_boolean_ai_detection",
+        "target_port": "ad_ids",
+        "dependency": false
+      },
+      {
+        "source_node": "broadcast_routing",
+        "source_port": "out_1",
+        "target_node": "pass5_seniority_management",
+        "target_port": "ad_ids",
+        "dependency": false
+      },
+      {
+        "source_node": "pass1_boolean_ai_detection",
+        "source_port": "successful_ad_ids",
+        "target_node": "join_passes",
+        "target_port": "pass1",
+        "dependency": false
+      },
+      {
+        "source_node": "pass5_seniority_management",
+        "source_port": "successful_ad_ids",
+        "target_node": "join_passes",
+        "target_port": "pass5",
+        "dependency": false
+      },
+      {
+        "source_node": "join_passes",
+        "source_port": "out",
+        "target_node": "assemble_wide_annotation",
+        "target_port": "passes_dict",
+        "dependency": false
+      }
+    ]
+  }
+}

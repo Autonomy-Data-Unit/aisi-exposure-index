@@ -43,6 +43,7 @@ dev = { path = "src/dev", editable = true }
 
 [project.scripts]
 run-pipeline = "ai_index.run_pipeline:main"
+run-ai-ad-annotations = "ai_annotations.cli:main"
 run-calibration = "calibration.run_calibration:main"
 estimate-calibration = "calibration.estimate:main"
 calibrate-all = "calibration.calibrate_all:main"
@@ -74,7 +75,7 @@ build-backend = "hatchling.build"
 [tool.hatch.build]
 ignore-vcs = true
 sources = ["src"]
-packages = ["src/ai_index", "src/isambard_utils", "src/dev_utils", "src/llm_runner", "src/calibration", "src/validation", "src/deploy"]
+packages = ["src/ai_index", "src/ai_annotations", "src/isambard_utils", "src/dev_utils", "src/llm_runner", "src/calibration", "src/validation", "src/deploy"]
 include = [
     "src/ai_index/scripts/**",
 ]

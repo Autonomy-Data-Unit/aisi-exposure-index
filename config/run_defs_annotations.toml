@@ -1,0 +1,65 @@
+# Run definitions for the AI job-ad annotation pipeline (config/netrun_annotations.json).
+# Defaults below are tuned for the Milestone-1 smoke run (5000 ads, Batch 1 only,
+# both passes routed `full` so the Pass-0-vs-Pass-1 cross-tab can be measured).
+
+[defaults]
+sample_n = 5000
+llm_model = "gemma-27b-sbatch"
+sbatch_cache = true
+duckdb_memory_limit = "4GB"
+temperature = 0.0
+top_p = 1.0
+top_k = -1
+
+[defaults.build_annotation_universe]
+input_run_name = "production_5m"
+
+[defaults.build_annotation_routing]
+# "full" for the smoke run so Pass 1 sees every ad regardless of Pass-0, which
+# lets the prefilter miss-rate be computed from a single execution.
+# Production should usually flip to "post_filter".
+batch1_route = "full"
+pass5_route = "full"
+
+[defaults.pass1_boolean_ai_detection]
+sbatch_time = "04:00:00"
+chunk_size = 200
+# Override the fleet default of 60 — pass-1 emits 9 booleans + a float + an
+# evidence quote, which 60 tokens will truncate.
+max_new_tokens = 256
+max_concurrent_chunks = 4
+pass_resume = true
+pass_max_retries = 1
+pass_raise_on_failure = false
+system_prompt = "ai_job_ad_annotations/pass1_boolean_ai_detection/system"
+user_prompt = "ai_job_ad_annotations/pass1_boolean_ai_detection/user_v1"
+prompt_version = "pass1_boolean_ai_detection_v1"
+
+[defaults.pass5_seniority_management]
+sbatch_time = "04:00:00"
+chunk_size = 200
+max_new_tokens = 256
+max_concurrent_chunks = 4
+pass_resume = true
+pass_max_retries = 1
+pass_raise_on_failure = false
+system_prompt = "ai_job_ad_annotations/pass5_seniority_management/system"
+user_prompt = "ai_job_ad_annotations/pass5_seniority_management/user_v1"
+prompt_version = "pass5_seniority_management_v1"
+
+
+# ----------
+#   Runs
+# ----------
+
+# Milestone 1 smoke run: 5000 ads from the production_5m exposure run.
+# All defaults above apply unchanged. Launch with:
+#   uv run run-ai-ad-annotations annotation_smoke_5k
+[runs.annotation_smoke_5k]
+sample_n = 5000
+
+# Full production annotation run over all 5M ads (post_filter routing in Batch 1
+# would normally be the right choice, but is left to be set explicitly when the
+# Milestone-1 prefilter miss-rate is known).
+[runs.annotation_production_5m]
+sample_n = -1

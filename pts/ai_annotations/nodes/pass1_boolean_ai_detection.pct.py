@@ -1,0 +1,319 @@
+# ---
+# jupyter:
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+
+# %% [markdown]
+# # nodes.pass1_boolean_ai_detection
+#
+# Pass 1 of the AI job-ad annotation pipeline. Asks the LLM nine boolean
+# questions about whether an ad mentions AI-related content, plus an overall
+# confidence and an optional evidence quote.
+#
+# Reads:
+# - `routing/annotation_universe_v1.parquet` for title and description.
+# - `routing/annotation_routing_v1.parquet` for `eligible_pass1`.
+#
+# Writes:
+# - `batch1_core_salience_seniority/pass1_results.duckdb` (ResultStore).
+# - `batch1_core_salience_seniority/pass1_boolean_ai_detection_v1.parquet` (parsed successes).
+# - `batch1_core_salience_seniority/pass1_boolean_ai_detection_v1_failures.parquet` (errors).
+# - `batch1_core_salience_seniority/pass1_meta.json`.
+#
+# The structured-output path is taken when the LLM model supports it
+# (`uses_structured_output(model)`); otherwise the LLM is asked for JSON and the
+# response is parsed with `extract_json`. Gemma-27b supports structured output,
+# so the smoke run uses the structured path.
+
+# %%
+#|default_exp pass1_boolean_ai_detection
+#|export_as_func true
+
+# %%
+#|set_func_signature
+async def main(ctx, print, ad_ids: list[int]) -> {
+    'successful_ad_ids': list[int]
+}:
+    """Run Pass 1 (boolean AI detection) on eligible ads."""
+    ...
+
+# %%
+from dev_utils import *
+run_name = 'annotation_smoke_5k'
+set_node_func_args('pass1_boolean_ai_detection', run_name=run_name)
+show_node_vars('pass1_boolean_ai_detection', run_name=run_name)
+
+# %% [markdown]
+# # Function body
+# ## Read node variables and resolve paths
+
+# %%
+#|export
+import json
+from datetime import datetime, timezone
+
+import duckdb
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from ai_index import const
+from ai_index.utils import (
+    ResultStore, run_batched, load_prompt, allm_generate,
+    extract_json, is_reasoning_model, uses_structured_output, strict_format,
+)
+from ai_annotations.schemas import BooleanAIDetectionV1
+
+run_name = ctx.vars["run_name"]
+llm_model = ctx.vars["llm_model"]
+sbatch_cache = ctx.vars["sbatch_cache"]
+sbatch_time = ctx.vars["sbatch_time"]
+chunk_size = ctx.vars["chunk_size"]
+max_new_tokens = ctx.vars["max_new_tokens"]
+temperature = ctx.vars["temperature"]
+top_p = ctx.vars["top_p"]
+top_k = ctx.vars["top_k"]
+max_concurrent = ctx.vars["max_concurrent_chunks"]
+resume = ctx.vars["pass_resume"]
+max_retries = ctx.vars["pass_max_retries"]
+raise_on_failure = ctx.vars["pass_raise_on_failure"]
+duckdb_memory_limit = ctx.vars["duckdb_memory_limit"]
+prompt_version = ctx.vars["prompt_version"]
+
+_is_reasoning = is_reasoning_model(llm_model)
+_use_structured_output = uses_structured_output(llm_model)
+
+_system_prompt_key = ctx.vars["system_prompt"]
+_user_prompt_key = ctx.vars["user_prompt"]
+if not _use_structured_output:
+    suffix = "_reasoning" if _is_reasoning else "_unstructured"
+    _system_prompt_key += suffix
+    _user_prompt_key += suffix
+
+SYSTEM_PROMPT = load_prompt(_system_prompt_key)
+USER_PROMPT_TEMPLATE = load_prompt(_user_prompt_key)
+
+annotations_dir = const.pipeline_store_path / run_name / "ai_job_ad_annotations"
+routing_dir = annotations_dir / "routing"
+output_dir = annotations_dir / "batch1_core_salience_seniority"
+output_dir.mkdir(parents=True, exist_ok=True)
+
+universe_path = routing_dir / "annotation_universe_v1.parquet"
+routing_path = routing_dir / "annotation_routing_v1.parquet"
+db_path = output_dir / "pass1_results.duckdb"
+out_parquet_path = output_dir / "pass1_boolean_ai_detection_v1.parquet"
+failures_path = output_dir / "pass1_boolean_ai_detection_v1_failures.parquet"
+meta_path = output_dir / "pass1_meta.json"
+
+print(f"pass1: model={llm_model}, structured_output={_use_structured_output}, reasoning={_is_reasoning}")
+
+# %% [markdown]
+# ## Filter to eligible ads and build the prompt map
+
+# %%
+#|export
+_routing = pq.read_table(routing_path, columns=["ad_id", "eligible_pass1"])
+_routing_df = _routing.to_pandas()
+_eligible_set = set(int(x) for x in _routing_df[_routing_df["eligible_pass1"]]["ad_id"].tolist())
+
+eligible_ad_ids = [int(aid) for aid in ad_ids if int(aid) in _eligible_set]
+print(f"pass1: {len(eligible_ad_ids)} / {len(ad_ids)} ads eligible for Pass 1")
+
+if not eligible_ad_ids:
+    print("pass1: no eligible ads; writing empty outputs and exiting")
+
+# %% [markdown]
+# ## Load title and description for eligible ads only
+
+# %%
+#|export
+_universe = pq.read_table(universe_path, columns=["ad_id", "title", "description"])
+_universe_df = _universe.to_pandas().set_index("ad_id")
+
+# Build prompts dict ad_id -> formatted user prompt
+ad_id_to_prompt = {}
+for aid in eligible_ad_ids:
+    row = _universe_df.loc[aid]
+    ad_id_to_prompt[aid] = strict_format(
+        USER_PROMPT_TEMPLATE,
+        title=row["title"] or "",
+        description=row["description"] or "",
+    )
+print(f"pass1: built {len(ad_id_to_prompt)} prompts")
+
+# %% [markdown]
+# ## Define the work function
+#
+# Mirrors `llm_filter_candidates`: build the prompt list for the chunk, call
+# `allm_generate` with the structured-output schema, parse responses, return a
+# DataFrame in the ResultStore schema.
+
+# %%
+#|export
+_slurm_jobs = []
+_schema_json = BooleanAIDetectionV1.model_json_schema() if _use_structured_output else None
+
+async def _work_fn(chunk_ids):
+    prompts = [ad_id_to_prompt[int(aid)] for aid in chunk_ids]
+    _sa = {}
+    responses = await allm_generate(
+        prompts,
+        model=llm_model,
+        system_message=SYSTEM_PROMPT,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        json_schema=_schema_json,
+        cache=sbatch_cache,
+        time=sbatch_time,
+        slurm_accounting=_sa,
+    )
+    if _sa:
+        _slurm_jobs.append(_sa)
+
+    records = []
+    for aid, response in zip(chunk_ids, responses):
+        try:
+            if _is_reasoning or not _use_structured_output:
+                parsed = extract_json(response, validator=BooleanAIDetectionV1.model_validate)
+                if parsed is None:
+                    records.append({"id": int(aid), "data": response, "error": "Failed to extract valid JSON from model output"})
+                    continue
+                stored = parsed.model_dump_json()
+            else:
+                parsed = BooleanAIDetectionV1.model_validate_json(response)
+                stored = parsed.model_dump_json()
+            records.append({"id": int(aid), "data": stored, "error": None})
+        except Exception as e:
+            records.append({"id": int(aid), "data": response, "error": f"{type(e).__name__}: {e}"})
+    return pd.DataFrame(records)
+
+# %% [markdown]
+# ## Run batched LLM calls
+
+# %%
+#|export
+store = ResultStore(db_path, {
+    "id": "BIGINT NOT NULL",
+    "data": "VARCHAR NOT NULL",
+    "error": "VARCHAR",
+}, memory_limit=duckdb_memory_limit)
+
+if eligible_ad_ids:
+    pass1_meta = await run_batched(
+        eligible_ad_ids, store, _work_fn,
+        batch_size=chunk_size,
+        max_concurrent=max_concurrent,
+        max_retries=max_retries,
+        resume=resume,
+        node_name="pass1_boolean_ai_detection",
+        print_fn=print,
+        raise_on_failure=raise_on_failure,
+    )
+else:
+    pass1_meta = {"n_attempted": 0, "n_success": 0, "n_failed": 0, "failed_ids": []}
+
+store.close()
+del store
+pass1_meta["slurm_jobs"] = _slurm_jobs
+pass1_meta["slurm_total_seconds"] = sum(j.get("elapsed_seconds", 0) for j in _slurm_jobs)
+pass1_meta["model_name"] = llm_model
+pass1_meta["prompt_version"] = prompt_version
+
+# %% [markdown]
+# ## Export successful rows and failures to parquet
+#
+# Schema fields plus shared metadata: ad_id, model_name, prompt_version,
+# run_timestamp, parse_success.
+
+# %%
+#|export
+run_timestamp = datetime.now(timezone.utc).isoformat()
+
+if eligible_ad_ids:
+    _conn = duckdb.connect(str(db_path))
+    success_rows = _conn.execute("SELECT id, data FROM results WHERE error IS NULL").fetchall()
+    failure_rows = _conn.execute("SELECT id, data, error FROM results WHERE error IS NOT NULL").fetchall()
+    _conn.close()
+else:
+    success_rows = []
+    failure_rows = []
+
+print(f"pass1: {len(success_rows)} successes, {len(failure_rows)} failures")
+
+# Build success rows: one row per ad with all 11 schema fields flattened + metadata
+_success_records = []
+for ad_id_raw, data_str in success_rows:
+    parsed_dict = json.loads(data_str)
+    _success_records.append({
+        "ad_id": int(ad_id_raw),
+        **parsed_dict,
+        "model_name": llm_model,
+        "prompt_version": prompt_version,
+        "run_timestamp": run_timestamp,
+        "parse_success": True,
+    })
+
+if _success_records:
+    success_df = pd.DataFrame(_success_records)
+    success_df.to_parquet(out_parquet_path, index=False)
+    print(f"pass1: wrote {const.rel(out_parquet_path)}")
+else:
+    # Write an empty parquet with the expected schema so downstream nodes can read it
+    empty_schema = pa.schema([
+        ("ad_id", pa.int64()),
+        ("mentions_ai_anywhere", pa.bool_()),
+        ("mentions_genai_or_llm", pa.bool_()),
+        ("mentions_ml_or_data_science_ai", pa.bool_()),
+        ("mentions_chatbot_or_conversational_ai", pa.bool_()),
+        ("mentions_ai_governance_or_risk", pa.bool_()),
+        ("mentions_ai_tool_use_by_worker", pa.bool_()),
+        ("mentions_building_or_maintaining_ai", pa.bool_()),
+        ("mentions_ai_product_or_company_domain", pa.bool_()),
+        ("mentions_automation_of_work", pa.bool_()),
+        ("boolean_pass_confidence", pa.float64()),
+        ("boolean_pass_evidence", pa.string()),
+        ("model_name", pa.string()),
+        ("prompt_version", pa.string()),
+        ("run_timestamp", pa.string()),
+        ("parse_success", pa.bool_()),
+    ])
+    pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_parquet_path)
+    print(f"pass1: wrote empty success parquet at {const.rel(out_parquet_path)}")
+
+_failure_records = []
+for ad_id_raw, data_str, error_str in failure_rows:
+    _failure_records.append({
+        "ad_id": int(ad_id_raw),
+        "prompt_version": prompt_version,
+        "model_name": llm_model,
+        "run_timestamp": run_timestamp,
+        "error_type": "ParseError",
+        "error_message": error_str,
+        "raw_output": data_str,
+    })
+if _failure_records:
+    pd.DataFrame(_failure_records).to_parquet(failures_path, index=False)
+    print(f"pass1: wrote {const.rel(failures_path)}")
+else:
+    failures_schema = pa.schema([
+        ("ad_id", pa.int64()),
+        ("prompt_version", pa.string()),
+        ("model_name", pa.string()),
+        ("run_timestamp", pa.string()),
+        ("error_type", pa.string()),
+        ("error_message", pa.string()),
+        ("raw_output", pa.string()),
+    ])
+    pq.write_table(pa.Table.from_pylist([], schema=failures_schema), failures_path)
+
+with open(meta_path, "w") as f:
+    json.dump(pass1_meta, f, indent=2)
+print(f"pass1: wrote {const.rel(meta_path)}")
+
+successful_ad_ids = [r["ad_id"] for r in _success_records]
+successful_ad_ids #|func_return_line

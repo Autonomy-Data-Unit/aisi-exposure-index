@@ -3,6 +3,9 @@ export_pipeline = """
 nbs_nodes -> lib_nodes
 nbs_nodes -> pts_nodes
 
+nbs_annotation_nodes -> lib_annotation_nodes
+nbs_annotation_nodes -> pts_annotation_nodes
+
 nbs_scratch -> pts_scratch
 
 nbs_validation -> lib_validation
@@ -12,6 +15,7 @@ nbs_validation -> pts_validation
 [fill]
 code_locations = [
     "nbs_nodes",
+    "nbs_annotation_nodes",
 ]
 exclude_patterns = [
     "**/*_v1.ipynb",
@@ -27,6 +31,19 @@ format = "percent"
 
 [cl.lib_nodes]
 path = "src/ai_index/nodes"
+format = "module"
+
+
+[cl.nbs_annotation_nodes]
+path = "nbs/ai_annotations/nodes"
+format = "ipynb"
+
+[cl.pts_annotation_nodes]
+path = "pts/ai_annotations/nodes"
+format = "percent"
+
+[cl.lib_annotation_nodes]
+path = "src/ai_annotations/nodes"
 format = "module"
 
 
