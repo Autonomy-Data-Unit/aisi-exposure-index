@@ -103,12 +103,15 @@ print(f"  selected {len(selected_ad_ids)} ad_ids for the annotation universe (sa
 print(f"build_annotation_universe: querying adzuna.duckdb for {len(selected_ad_ids)} ads")
 con = duckdb.connect(str(adzuna_db_path), read_only=True)
 con.register("selected", pa.Table.from_pydict({"ad_id": selected_ad_ids}))
+# adzuna.ads stores the join key as `id`; the rest of the pipeline calls it
+# `ad_id` (e.g. compute_job_ad_exposure/ad_exposure.parquet), so we alias on
+# read to keep the annotation branch on the `ad_id` convention.
 universe_table = con.execute(
     """
-    SELECT a.ad_id, a.title, a.description
+    SELECT a.id AS ad_id, a.title, a.description
     FROM ads a
-    INNER JOIN selected s ON s.ad_id = a.ad_id
-    ORDER BY a.ad_id
+    INNER JOIN selected s ON s.ad_id = a.id
+    ORDER BY a.id
     """
 ).fetch_arrow_table()
 con.close()
