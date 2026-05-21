@@ -1,0 +1,280 @@
+# ---
+# jupyter:
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
+
+# %% [markdown]
+# # nodes.pass3_ai_requirement
+#
+# Pass 3: classify whether the ad asks the worker for AI-related skills,
+# experience, or knowledge (`ai_requirement_level`) and the main kind of AI
+# requirement (`ai_requirement_kind`).
+#
+# Eligibility: `routing/annotation_routing_v1.parquet` column `eligible_pass3`
+# (Pass-1-positive under post_filter).
+
+# %%
+#|default_exp pass3_ai_requirement
+#|export_as_func true
+
+# %%
+#|set_func_signature
+async def main(ctx, print, ad_ids: list[int]) -> {
+    'successful_ad_ids': list[int]
+}:
+    """Run Pass 3 (AI requirement level + kind) on eligible ads."""
+    ...
+
+# %%
+from dev_utils import *
+run_name = 'annotation_smoke_5k'
+set_node_func_args('pass3_ai_requirement', run_name=run_name)
+show_node_vars('pass3_ai_requirement', run_name=run_name)
+
+# %% [markdown]
+# # Function body
+
+# %%
+#|export
+import json
+from datetime import datetime, timezone
+
+import duckdb
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+
+from ai_index import const
+from ai_index.utils import (
+    ResultStore, run_batched, load_prompt, allm_generate,
+    extract_json, is_reasoning_model, uses_structured_output, strict_format,
+)
+from ai_annotations.schemas import AIRequirementV1
+
+run_name = ctx.vars["run_name"]
+llm_model = ctx.vars["llm_model"]
+sbatch_cache = ctx.vars["sbatch_cache"]
+sbatch_time = ctx.vars["sbatch_time"]
+chunk_size = ctx.vars["chunk_size"]
+max_new_tokens = ctx.vars["max_new_tokens"]
+temperature = ctx.vars["temperature"]
+top_p = ctx.vars["top_p"]
+top_k = ctx.vars["top_k"]
+max_concurrent = ctx.vars["max_concurrent_chunks"]
+resume = ctx.vars["pass_resume"]
+max_retries = ctx.vars["pass_max_retries"]
+raise_on_failure = ctx.vars["pass_raise_on_failure"]
+duckdb_memory_limit = ctx.vars["duckdb_memory_limit"]
+prompt_version = ctx.vars["prompt_version"]
+
+_is_reasoning = is_reasoning_model(llm_model)
+_use_structured_output = uses_structured_output(llm_model)
+
+_system_prompt_key = ctx.vars["system_prompt"]
+_user_prompt_key = ctx.vars["user_prompt"]
+if not _use_structured_output:
+    suffix = "_reasoning" if _is_reasoning else "_unstructured"
+    _system_prompt_key += suffix
+    _user_prompt_key += suffix
+
+SYSTEM_PROMPT = load_prompt(_system_prompt_key)
+USER_PROMPT_TEMPLATE = load_prompt(_user_prompt_key)
+
+annotations_dir = const.pipeline_store_path / run_name / "ai_job_ad_annotations"
+routing_dir = annotations_dir / "routing"
+output_dir = annotations_dir / "batch2_requirements_context"
+output_dir.mkdir(parents=True, exist_ok=True)
+
+universe_path = routing_dir / "annotation_universe_v1.parquet"
+routing_path = routing_dir / "annotation_routing_v1.parquet"
+db_path = output_dir / "pass3_results.duckdb"
+out_parquet_path = output_dir / "pass3_ai_requirement_v1.parquet"
+failures_path = output_dir / "pass3_ai_requirement_v1_failures.parquet"
+meta_path = output_dir / "pass3_meta.json"
+
+print(f"pass3: model={llm_model}, structured_output={_use_structured_output}, reasoning={_is_reasoning}")
+
+# %% [markdown]
+# ## Filter to eligible ads and build prompts
+
+# %%
+#|export
+_routing = pq.read_table(routing_path, columns=["ad_id", "eligible_pass3"])
+_routing_df = _routing.to_pandas()
+_eligible_set = set(int(x) for x in _routing_df[_routing_df["eligible_pass3"]]["ad_id"].tolist())
+
+eligible_ad_ids = [int(aid) for aid in ad_ids if int(aid) in _eligible_set]
+print(f"pass3: {len(eligible_ad_ids)} / {len(ad_ids)} ads eligible for Pass 3")
+
+_universe = pq.read_table(universe_path, columns=["ad_id", "title", "description"])
+_universe_df = _universe.to_pandas().set_index("ad_id")
+
+ad_id_to_prompt = {}
+for aid in eligible_ad_ids:
+    row = _universe_df.loc[aid]
+    ad_id_to_prompt[aid] = strict_format(
+        USER_PROMPT_TEMPLATE,
+        title=row["title"] or "",
+        description=row["description"] or "",
+    )
+print(f"pass3: built {len(ad_id_to_prompt)} prompts")
+
+# %% [markdown]
+# ## Work function
+
+# %%
+#|export
+_slurm_jobs = []
+_schema_json = AIRequirementV1.model_json_schema() if _use_structured_output else None
+
+async def _work_fn(chunk_ids):
+    prompts = [ad_id_to_prompt[int(aid)] for aid in chunk_ids]
+    _sa = {}
+    responses = await allm_generate(
+        prompts,
+        model=llm_model,
+        system_message=SYSTEM_PROMPT,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        json_schema=_schema_json,
+        cache=sbatch_cache,
+        time=sbatch_time,
+        slurm_accounting=_sa,
+    )
+    if _sa:
+        _slurm_jobs.append(_sa)
+
+    records = []
+    for aid, response in zip(chunk_ids, responses):
+        try:
+            if _is_reasoning or not _use_structured_output:
+                parsed = extract_json(response, validator=AIRequirementV1.model_validate)
+                if parsed is None:
+                    records.append({"id": int(aid), "data": response, "error": "Failed to extract valid JSON from model output"})
+                    continue
+                stored = parsed.model_dump_json()
+            else:
+                parsed = AIRequirementV1.model_validate_json(response)
+                stored = parsed.model_dump_json()
+            records.append({"id": int(aid), "data": stored, "error": None})
+        except Exception as e:
+            records.append({"id": int(aid), "data": response, "error": f"{type(e).__name__}: {e}"})
+    return pd.DataFrame(records)
+
+# %% [markdown]
+# ## Run batched LLM calls
+
+# %%
+#|export
+store = ResultStore(db_path, {
+    "id": "BIGINT NOT NULL",
+    "data": "VARCHAR NOT NULL",
+    "error": "VARCHAR",
+}, memory_limit=duckdb_memory_limit)
+
+if eligible_ad_ids:
+    pass3_meta = await run_batched(
+        eligible_ad_ids, store, _work_fn,
+        batch_size=chunk_size,
+        max_concurrent=max_concurrent,
+        max_retries=max_retries,
+        resume=resume,
+        node_name="pass3_ai_requirement",
+        print_fn=print,
+        raise_on_failure=raise_on_failure,
+    )
+else:
+    pass3_meta = {"n_attempted": 0, "n_success": 0, "n_failed": 0, "failed_ids": []}
+
+store.close()
+del store
+pass3_meta["slurm_jobs"] = _slurm_jobs
+pass3_meta["slurm_total_seconds"] = sum(j.get("elapsed_seconds", 0) for j in _slurm_jobs)
+pass3_meta["model_name"] = llm_model
+pass3_meta["prompt_version"] = prompt_version
+
+# %% [markdown]
+# ## Export successes and failures
+
+# %%
+#|export
+run_timestamp = datetime.now(timezone.utc).isoformat()
+
+if eligible_ad_ids:
+    _conn = duckdb.connect(str(db_path))
+    success_rows = _conn.execute("SELECT id, data FROM results WHERE error IS NULL").fetchall()
+    failure_rows = _conn.execute("SELECT id, data, error FROM results WHERE error IS NOT NULL").fetchall()
+    _conn.close()
+else:
+    success_rows = []
+    failure_rows = []
+
+print(f"pass3: {len(success_rows)} successes, {len(failure_rows)} failures")
+
+_success_records = []
+for ad_id_raw, data_str in success_rows:
+    parsed_dict = json.loads(data_str)
+    _success_records.append({
+        "ad_id": int(ad_id_raw),
+        **parsed_dict,
+        "model_name": llm_model,
+        "prompt_version": prompt_version,
+        "run_timestamp": run_timestamp,
+        "parse_success": True,
+    })
+
+if _success_records:
+    pd.DataFrame(_success_records).to_parquet(out_parquet_path, index=False)
+    print(f"pass3: wrote {const.rel(out_parquet_path)}")
+else:
+    empty_schema = pa.schema([
+        ("ad_id", pa.int64()),
+        ("ai_requirement_level", pa.string()),
+        ("ai_requirement_kind", pa.string()),
+        ("ai_requirement_confidence", pa.float64()),
+        ("ai_requirement_evidence", pa.string()),
+        ("model_name", pa.string()),
+        ("prompt_version", pa.string()),
+        ("run_timestamp", pa.string()),
+        ("parse_success", pa.bool_()),
+    ])
+    pq.write_table(pa.Table.from_pylist([], schema=empty_schema), out_parquet_path)
+    print(f"pass3: wrote empty success parquet at {const.rel(out_parquet_path)}")
+
+_failure_records = []
+for ad_id_raw, data_str, error_str in failure_rows:
+    _failure_records.append({
+        "ad_id": int(ad_id_raw),
+        "prompt_version": prompt_version,
+        "model_name": llm_model,
+        "run_timestamp": run_timestamp,
+        "error_type": "ParseError",
+        "error_message": error_str,
+        "raw_output": data_str,
+    })
+if _failure_records:
+    pd.DataFrame(_failure_records).to_parquet(failures_path, index=False)
+    print(f"pass3: wrote {const.rel(failures_path)}")
+else:
+    failures_schema = pa.schema([
+        ("ad_id", pa.int64()),
+        ("prompt_version", pa.string()),
+        ("model_name", pa.string()),
+        ("run_timestamp", pa.string()),
+        ("error_type", pa.string()),
+        ("error_message", pa.string()),
+        ("raw_output", pa.string()),
+    ])
+    pq.write_table(pa.Table.from_pylist([], schema=failures_schema), failures_path)
+
+with open(meta_path, "w") as f:
+    json.dump(pass3_meta, f, indent=2)
+print(f"pass3: wrote {const.rel(meta_path)}")
+
+successful_ad_ids = [r["ad_id"] for r in _success_records]
+successful_ad_ids #|func_return_line

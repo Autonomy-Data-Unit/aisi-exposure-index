@@ -1,6 +1,8 @@
 # Run definitions for the AI job-ad annotation pipeline (config/netrun_annotations.json).
-# Defaults below are tuned for the Milestone-1 smoke run (5000 ads, Batch 1 only,
-# both passes routed `full` so the Pass-0-vs-Pass-1 cross-tab can be measured).
+# Defaults below cover all six LLM passes. For the smoke run Passes 2/3/4/6 are
+# routed `post_filter` (Pass-1-positive only) while Pass 1 and Pass 5 are `full`,
+# which gives the spec's prefilter miss-rate measurement on Pass 1 and exercises
+# every downstream pass on whatever AI-positive ads exist.
 
 [defaults]
 sample_n = 5000
@@ -15,17 +17,22 @@ top_k = -1
 input_run_name = "production_5m"
 
 [defaults.build_annotation_routing]
-# "full" for the smoke run so Pass 1 sees every ad regardless of Pass-0, which
-# lets the prefilter miss-rate be computed from a single execution.
-# Production should usually flip to "post_filter".
+# Pass 1 routed `full` so the Pass-0-vs-Pass-1 cross-tab (prefilter miss rate)
+# is measurable from the smoke run itself.
 batch1_route = "full"
+# Pass 5 is seniority-for-all-ads; always `full` unless compute forces otherwise.
 pass5_route = "full"
+# Passes 2/3/4 follow Pass-1-positive routing by default — the spec's standard
+# production setup. Override to `full` if you want every ad scored regardless.
+batch2_route = "post_filter"
+batch3_route = "post_filter"
+# Pass 6 is a quality/robustness layer; default to inherit batch3_route, but
+# the spec allows running it on `full` while Pass 4 stays post_filter.
+pass6_route_override = "inherit"
 
 [defaults.pass1_boolean_ai_detection]
 sbatch_time = "04:00:00"
 chunk_size = 200
-# Override the fleet default of 60 — pass-1 emits 9 booleans + a float + an
-# evidence quote, which 60 tokens will truncate.
 max_new_tokens = 256
 max_concurrent_chunks = 4
 pass_resume = true
@@ -34,6 +41,42 @@ pass_raise_on_failure = false
 system_prompt = "ai_job_ad_annotations/pass1_boolean_ai_detection/system"
 user_prompt = "ai_job_ad_annotations/pass1_boolean_ai_detection/user_v1"
 prompt_version = "pass1_boolean_ai_detection_v1"
+
+[defaults.pass2_ai_mention_context]
+sbatch_time = "04:00:00"
+chunk_size = 200
+max_new_tokens = 256
+max_concurrent_chunks = 4
+pass_resume = true
+pass_max_retries = 1
+pass_raise_on_failure = false
+system_prompt = "ai_job_ad_annotations/pass2_ai_mention_context/system"
+user_prompt = "ai_job_ad_annotations/pass2_ai_mention_context/user_v1"
+prompt_version = "pass2_ai_mention_context_v1"
+
+[defaults.pass3_ai_requirement]
+sbatch_time = "04:00:00"
+chunk_size = 200
+max_new_tokens = 256
+max_concurrent_chunks = 4
+pass_resume = true
+pass_max_retries = 1
+pass_raise_on_failure = false
+system_prompt = "ai_job_ad_annotations/pass3_ai_requirement/system"
+user_prompt = "ai_job_ad_annotations/pass3_ai_requirement/user_v1"
+prompt_version = "pass3_ai_requirement_v1"
+
+[defaults.pass4_worker_ai_tool_use]
+sbatch_time = "04:00:00"
+chunk_size = 200
+max_new_tokens = 256
+max_concurrent_chunks = 4
+pass_resume = true
+pass_max_retries = 1
+pass_raise_on_failure = false
+system_prompt = "ai_job_ad_annotations/pass4_worker_ai_tool_use/system"
+user_prompt = "ai_job_ad_annotations/pass4_worker_ai_tool_use/user_v1"
+prompt_version = "pass4_worker_ai_tool_use_v1"
 
 [defaults.pass5_seniority_management]
 sbatch_time = "04:00:00"
@@ -47,19 +90,39 @@ system_prompt = "ai_job_ad_annotations/pass5_seniority_management/system"
 user_prompt = "ai_job_ad_annotations/pass5_seniority_management/user_v1"
 prompt_version = "pass5_seniority_management_v1"
 
+[defaults.pass6_quality_remote_agency]
+sbatch_time = "04:00:00"
+chunk_size = 200
+max_new_tokens = 256
+max_concurrent_chunks = 4
+pass_resume = true
+pass_max_retries = 1
+pass_raise_on_failure = false
+system_prompt = "ai_job_ad_annotations/pass6_quality_remote_agency/system"
+user_prompt = "ai_job_ad_annotations/pass6_quality_remote_agency/user_v1"
+prompt_version = "pass6_quality_remote_agency_v1"
+
 
 # ----------
 #   Runs
 # ----------
 
-# Milestone 1 smoke run: 5000 ads from the production_5m exposure run.
-# All defaults above apply unchanged. Launch with:
-#   uv run run-ai-ad-annotations annotation_smoke_5k
+# Milestone 1 smoke run: 5000 ads from production_5m. All six passes wired;
+# Pass 1 + Pass 5 on the full 5000, Passes 2/3/4/6 on the Pass-1-positive
+# subset only. Launch with: uv run run-ai-ad-annotations annotation_smoke_5k
 [runs.annotation_smoke_5k]
 sample_n = 5000
 
-# Full production annotation run over all 5M ads (post_filter routing in Batch 1
-# would normally be the right choice, but is left to be set explicitly when the
-# Milestone-1 prefilter miss-rate is known).
+# Variant that runs every pass on every ad (max coverage, more GPU time).
+[runs.annotation_smoke_5k_full]
+sample_n = 5000
+
+[runs.annotation_smoke_5k_full.build_annotation_routing]
+batch2_route = "full"
+batch3_route = "full"
+
+# Full production annotation run over all 5M ads. Post-filter on Batches 2/3
+# is the right default; revisit once the Milestone-1 prefilter miss-rate is
+# known.
 [runs.annotation_production_5m]
 sample_n = -1

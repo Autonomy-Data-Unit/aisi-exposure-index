@@ -7,18 +7,29 @@ def main(ctx, print, ad_ids: list[int]) -> {
     import json
     
     import pyarrow as pa
+    import pyarrow.compute as pc
     import pyarrow.parquet as pq
     
     from ai_index import const
     
     run_name = ctx.vars["run_name"]
     batch1_route = ctx.vars["batch1_route"]
+    batch2_route = ctx.vars["batch2_route"]
+    batch3_route = ctx.vars["batch3_route"]
     pass5_route = ctx.vars["pass5_route"]
+    pass6_route_override = ctx.vars["pass6_route_override"]
     
-    if batch1_route not in ("full", "post_filter"):
-        raise ValueError(f"batch1_route must be 'full' or 'post_filter', got {batch1_route!r}")
-    if pass5_route not in ("full", "post_filter"):
-        raise ValueError(f"pass5_route must be 'full' or 'post_filter', got {pass5_route!r}")
+    _VALID_ROUTES = ("full", "post_filter")
+    for _name, _val in [
+        ("batch1_route", batch1_route),
+        ("batch2_route", batch2_route),
+        ("batch3_route", batch3_route),
+        ("pass5_route", pass5_route),
+    ]:
+        if _val not in _VALID_ROUTES:
+            raise ValueError(f"{_name} must be one of {_VALID_ROUTES}, got {_val!r}")
+    if pass6_route_override not in (*_VALID_ROUTES, "inherit"):
+        raise ValueError(f"pass6_route_override must be 'full', 'post_filter', or 'inherit', got {pass6_route_override!r}")
     
     routing_dir = const.pipeline_store_path / run_name / "ai_job_ad_annotations" / "routing"
     universe_path = routing_dir / "annotation_universe_v1.parquet"
@@ -33,12 +44,9 @@ def main(ctx, print, ad_ids: list[int]) -> {
     _universe_ids = pq.read_table(universe_path, columns=["ad_id"])
     _pass0 = pq.read_table(pass0_path, columns=["ad_id", "prefilter_ai_keyword_hit"])
     
-    # Join on ad_id, ordered by universe order (which is sorted ascending)
-    import pyarrow.compute as pc
     _pass0_sorted = _pass0.take(pc.sort_indices(_pass0, sort_keys=[("ad_id", "ascending")]))
     _universe_sorted = _universe_ids.take(pc.sort_indices(_universe_ids, sort_keys=[("ad_id", "ascending")]))
     
-    # The two should have identical ad_id order since both came from the same upstream
     _u_ids = _universe_sorted.column("ad_id").to_pylist()
     _p0_ids = _pass0_sorted.column("ad_id").to_pylist()
     if _u_ids != _p0_ids:
@@ -66,28 +74,57 @@ def main(ctx, print, ad_ids: list[int]) -> {
     else:
         print("  no Pass 1 output yet; route_pass1_ai_positive set to false for all rows")
         route_pass1_ai_positive = pa.array([False] * n_ads, type=pa.bool_())
-    if batch1_route == "full":
-        eligible_pass1 = pa.array([True] * n_ads, type=pa.bool_())
-    else:  # post_filter
-        eligible_pass1 = route_pass0_keyword_positive
+    _all_true = pa.array([True] * n_ads, type=pa.bool_())
     
-    if pass5_route == "full":
-        eligible_pass5 = pa.array([True] * n_ads, type=pa.bool_())
-    else:  # post_filter — same as Pass 1's keyword-positive set
-        eligible_pass5 = route_pass0_keyword_positive
+    def _eligibility_for_batch(route_mode: str, post_filter_source: pa.Array) -> pa.Array:
+        """`full` -> all true; `post_filter` -> the supplied source column."""
+        return _all_true if route_mode == "full" else post_filter_source
     
-    n_elig_p1 = int(pc.sum(eligible_pass1).as_py())
-    n_elig_p5 = int(pc.sum(eligible_pass5).as_py())
-    print(f"  eligible: pass1={n_elig_p1} (route={batch1_route}), pass5={n_elig_p5} (route={pass5_route})")
+    # Pass 1: gated by Pass 0 under post_filter
+    eligible_pass1 = _eligibility_for_batch(batch1_route, route_pass0_keyword_positive)
+    
+    # Pass 5: independent, follows its own pass5_route. post_filter for Pass 5
+    # means "the same Pass-0 keyword-positive set" (it never uses Pass-1 since
+    # Pass 5 is conceptually upstream of any AI-content judgement).
+    eligible_pass5 = _eligibility_for_batch(pass5_route, route_pass0_keyword_positive)
+    
+    # Passes 2, 3, 4: gated by Pass-1-positive under post_filter
+    eligible_pass2 = _eligibility_for_batch(batch2_route, route_pass1_ai_positive)
+    eligible_pass3 = _eligibility_for_batch(batch2_route, route_pass1_ai_positive)
+    eligible_pass4 = _eligibility_for_batch(batch3_route, route_pass1_ai_positive)
+    
+    # Pass 6: by default inherits batch3_route, but can be overridden to `full`
+    # even when the rest of Batch 3 is post_filter (per the spec).
+    pass6_effective_route = batch3_route if pass6_route_override == "inherit" else pass6_route_override
+    eligible_pass6 = _eligibility_for_batch(pass6_effective_route, route_pass1_ai_positive)
+    
+    _eligibilities = {
+        "pass1": eligible_pass1,
+        "pass2": eligible_pass2,
+        "pass3": eligible_pass3,
+        "pass4": eligible_pass4,
+        "pass5": eligible_pass5,
+        "pass6": eligible_pass6,
+    }
+    _n_elig = {k: int(pc.sum(v).as_py()) for k, v in _eligibilities.items()}
+    print(f"  eligible: " + ", ".join(f"{k}={n}" for k, n in _n_elig.items()))
+    print(f"  routes: batch1={batch1_route}, batch2={batch2_route}, batch3={batch3_route}, pass5={pass5_route}, pass6_override={pass6_route_override}")
     routing_table = pa.table({
         "ad_id": ad_ids_arr,
-        "annotation_universe_included": pa.array([True] * n_ads, type=pa.bool_()),
+        "annotation_universe_included": _all_true,
         "route_pass0_keyword_positive": route_pass0_keyword_positive,
         "route_pass1_ai_positive": route_pass1_ai_positive,
         "eligible_pass1": eligible_pass1,
+        "eligible_pass2": eligible_pass2,
+        "eligible_pass3": eligible_pass3,
+        "eligible_pass4": eligible_pass4,
         "eligible_pass5": eligible_pass5,
+        "eligible_pass6": eligible_pass6,
         "batch1_route_mode": pa.array([batch1_route] * n_ads, type=pa.string()),
+        "batch2_route_mode": pa.array([batch2_route] * n_ads, type=pa.string()),
+        "batch3_route_mode": pa.array([batch3_route] * n_ads, type=pa.string()),
         "pass5_route_mode": pa.array([pass5_route] * n_ads, type=pa.string()),
+        "pass6_route_mode": pa.array([pass6_effective_route] * n_ads, type=pa.string()),
     })
     pq.write_table(routing_table, routing_path)
     print(f"build_annotation_routing: wrote {const.rel(routing_path)}")
@@ -96,10 +133,15 @@ def main(ctx, print, ad_ids: list[int]) -> {
         "n_ads": n_ads,
         "n_pass0_positive": n_pass0_pos,
         "n_pass1_positive": int(pc.sum(route_pass1_ai_positive).as_py()),
-        "n_eligible_pass1": n_elig_p1,
-        "n_eligible_pass5": n_elig_p5,
-        "batch1_route": batch1_route,
-        "pass5_route": pass5_route,
+        "n_eligible": _n_elig,
+        "routes": {
+            "batch1": batch1_route,
+            "batch2": batch2_route,
+            "batch3": batch3_route,
+            "pass5": pass5_route,
+            "pass6_override": pass6_route_override,
+            "pass6_effective": pass6_effective_route,
+        },
         "pass1_source": str(const.rel(pass1_path)) if pass1_path.exists() else None,
     }
     with open(meta_path, "w") as f:
