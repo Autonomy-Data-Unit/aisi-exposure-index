@@ -44,8 +44,8 @@
     }
   },
   "max_epochs": 1,
-  "retries": 3,
-  "retry_wait": 10,
+  "retries": 10,
+  "retry_wait": 30,
   "project_root_override": "../",
   "graph": {
     "nodes": [
