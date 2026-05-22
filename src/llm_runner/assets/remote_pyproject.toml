@@ -2,10 +2,12 @@
 # Only lists the dependencies llm_runner actually needs — not the
 # full ai-index project. Uploaded by asetup_runner().
 #
-# IMPORTANT: torch must come from the CUDA index (PyPI only has CPU-only
-# wheels for aarch64/GH200). The [tool.uv.sources] section pins this so
-# `uv sync` installs CUDA torch directly, avoiding the fragile post-hoc
-# reinstall step.
+# Torch is sourced from the pytorch.org cu126 index directly via the
+# [tool.uv.sources] section, so `uv sync` installs the CUDA build (with
+# +cu126 in the version string) on the very first sync. The post-install
+# _aensure_cuda_torch reinstall step is now a safety net for venvs that
+# pre-date this change; it pins the lock-resolved version so the cu126
+# index's latest release can't drift away from vllm's compiled ABI.
 
 [project]
 name = "llm-runner"
@@ -15,16 +17,43 @@ dependencies = [
     "numpy",
     "pyarrow>=17.0",
     "importlib-metadata",
-    "torch>=2.0",
+    # Pin torch to a version that exists on the cu126 index AND that a
+    # supported vllm wheel was compiled against. cu126 aarch64+cp312 has
+    # wheels for 2.6, 2.9, 2.10, 2.11, 2.12 (notably NOT 2.7 or 2.8).
+    # vllm 0.20+ wheels pin `torch==2.11.0`, so we pin both here.
+    "torch==2.11.0",
+    "torchvision==0.26.0",
     "sentence-transformers>=5.0",
     "transformers>=5.0",
     "accelerate>=1.0",
-    "vllm",
+    # vllm 0.11.0 (previous pin) required torch==2.8.0, which is NOT in the
+    # cu126 aarch64+cp312 index, forcing _aensure_cuda_torch to install a
+    # newer torch and break vllm's c10::cuda symbol expectations. vllm 0.20+
+    # is compiled against torch 2.11 which is in cu126.
+    "vllm>=0.20",
     "nest-asyncio>=1.6",
 ]
 
+# Restrict the lock to aarch64-linux (Isambard GH200). Without this, uv
+# resolves universally and falls back to ancient vllm versions for
+# platforms that don't have a recent vllm wheel (e.g. macOS arm64),
+# pulling vllm 0.2.5 instead of 0.11.0.
 [tool.uv]
-extra-index-url = ["https://download.pytorch.org/whl/cu126"]
+environments = ["sys_platform == 'linux' and platform_machine == 'aarch64'"]
+
+# Resolve torch and torchvision from the pytorch.org cu126 index so the
+# locked version is the CUDA build, not the CPU-only PyPI default.
+# vllm stays on PyPI; its wheel encodes which torch ABI it was compiled
+# against, so as long as torch's version matches what vllm was built for,
+# the ABI is consistent.
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
 
 [build-system]
 requires = ["hatchling"]

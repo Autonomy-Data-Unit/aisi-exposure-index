@@ -500,7 +500,7 @@ async def asetup_runner(*, config: IsambardConfig | None = None, print_fn=_fprin
             return
         import subprocess
         config = _get_config(config)
-        from .env import _aensure_uv, _aensure_venv, _aensure_cuda_torch, _afix_lustre_hardlinks
+        from .env import _aensure_uv, _aensure_venv, _aensure_cuda_torch, _afix_lustre_hardlinks, averify_runner_env
         from .transfer import aupload as async_rsync_upload, aupload_bytes
         import llm_runner
 
@@ -540,6 +540,12 @@ async def asetup_runner(*, config: IsambardConfig | None = None, print_fn=_fprin
 
             # 7. Fix Lustre hardlinks (one-time migration to copy mode)
             await _afix_lustre_hardlinks(config=config)
+
+            # 8. Sanity check: import torch+vllm together so any ABI mismatch
+            #    or missing-file corruption fails NOW (visible in bg-job.log)
+            #    instead of 12 hours later when a chunk actually runs.
+            await averify_runner_env(config=config, print_fn=print_fn)
+
             print_fn("runner setup: done")
             _setup_done = True
 
