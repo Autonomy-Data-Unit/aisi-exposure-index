@@ -1,0 +1,177 @@
+# AI keyword dictionary v1
+#
+# Used by the deterministic regex sweep over the production_5m corpus
+# (see nbs/analysis/04_keyword_demand_analysis.ipynb). Every output that
+# leaves the sweep is stamped with `dictionary_version` from this file.
+#
+# Schema
+#   dictionary_version : str
+#   [families.<key>]
+#     display_name : str
+#     terms        : list of str OR list of inline tables
+#                    {canonical = "...", regex_override = "..."}.
+#                    Bare strings get the auto-anchor rule applied (leading
+#                    \b iff first char alphanumeric, trailing \b iff last
+#                    char alphanumeric, literal "." escaped). regex_override
+#                    bypasses the rule completely for special cases.
+
+dictionary_version = "v1"
+
+# -----------------------------------------------------------------------------
+# Family 1: Generic AI mentions
+# -----------------------------------------------------------------------------
+[families.generic_ai]
+display_name = "Generic AI"
+terms = [
+    "artificial intelligence",
+    "ai",
+    "ai-",
+    "ai/",
+    "a.i.",
+    "algorithmic",
+    "intelligent automation",
+]
+
+# -----------------------------------------------------------------------------
+# Family 2: AI tool use & assistive phrasing
+#   High-recall family that picks up AI diffusing into non-technical ads.
+# -----------------------------------------------------------------------------
+[families.ai_tool_use]
+display_name = "AI tool use & assistive phrasing"
+terms = [
+    "ai tool",
+    "ai tools",
+    "ai-assisted",
+    "ai assisted",
+    "ai-powered",
+    "ai powered",
+    "ai-enabled",
+    "ai enabled",
+    "ai-driven",
+    "ai driven",
+    "ai-based",
+    "ai based",
+    "using ai",
+    "with ai",
+    "leverage ai",
+    "ai capabilities",
+    "ai solutions",
+    "ai features",
+    "intelligent document",
+    "semantic search",
+]
+
+# -----------------------------------------------------------------------------
+# Family 3: Machine learning (classical)
+#   Present in both 2022 and 2025, ~level effect across the ChatGPT cut.
+# -----------------------------------------------------------------------------
+[families.machine_learning]
+display_name = "Machine learning"
+terms = [
+    "machine learning",
+    "ml",
+    "ml engineer",
+    "deep learning",
+    "predictive model",
+    "predictive modelling",
+    "model training",
+    "classification model",
+    "recommendation system",
+    "recommender",
+    "computer vision",
+    "natural language processing",
+    "nlp",
+    "pytorch",
+    "tensorflow",
+    "scikit-learn",
+    "sklearn",
+    "keras",
+    "xgboost",
+    "spacy",
+    "transformer",
+    "fine-tune",
+    "fine-tuning",
+    "embeddings",
+    "foundation model",
+    "multimodal",
+    "diffusion model",
+    "reinforcement learning",
+    "rlhf",
+]
+
+# -----------------------------------------------------------------------------
+# Family 4: Generative AI & LLMs
+#   The 2022->2025 diffusion signal (ChatGPT released 2022-11-30).
+# -----------------------------------------------------------------------------
+[families.generative_ai]
+display_name = "Generative AI & LLMs"
+terms = [
+    "generative ai",
+    "genai",
+    "large language model",
+    "llm",
+    "llms",
+    "gpt",
+    "chatgpt",
+    "claude",
+    "gemini",
+    "bard",
+    "llama",
+    "mistral",
+    "perplexity",
+    "midjourney",
+    "dall-e",
+    "stable diffusion",
+    "copilot",
+    "github copilot",
+    "microsoft copilot",
+    "openai",
+    "anthropic",
+    "hugging face",
+    "huggingface",
+    "bedrock",
+    "azure openai",
+    "vertex ai",
+    "cursor",
+    "prompt engineer",
+    "prompt engineering",
+    "rag",
+    "retrieval augmented generation",
+    "vector database",
+    "langchain",
+    "llamaindex",
+    "ai agent",
+    "agentic",
+]
+
+# -----------------------------------------------------------------------------
+# Family 5: AI operations & governance
+# -----------------------------------------------------------------------------
+[families.ai_ops_governance]
+display_name = "AI operations & governance"
+terms = [
+    "mlops",
+    "model deployment",
+    "model monitoring",
+    "model evaluation",
+    "ai safety",
+    "responsible ai",
+    "ai governance",
+    "algorithmic bias",
+    "model risk",
+    "explainable ai",
+    "xai",
+]
+
+# -----------------------------------------------------------------------------
+# Family 6: Chatbots & likely AI automation
+# -----------------------------------------------------------------------------
+[families.chatbot_automation]
+display_name = "Chatbots & AI automation"
+terms = [
+    "chatbot",
+    "virtual assistant",
+    "conversational ai",
+    "automated decision",
+    "intelligent assistant",
+]
